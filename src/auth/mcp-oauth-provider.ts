@@ -140,8 +140,12 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
     const { oidcConfig, providerMetadata } = await this.getOidcConfig();
 
-    // Generate our own PKCE for the upstream OIDC flow
-    const upstreamPkce = oidcConfig.enablePKCEAuthentication ? generatePKCEChallenge() : undefined;
+    // Generate our own PKCE for the upstream OIDC flow. Always generate one
+    // (see the identical fix in sso-login.ts) rather than gating on
+    // oidcConfig.enablePKCEAuthentication -- that flag reflects ArgoCD's own
+    // config, not whether the upstream identity provider (e.g. Okta) requires
+    // PKCE for its public/native client.
+    const upstreamPkce = generatePKCEChallenge();
     const upstreamState = generateState();
 
     const callbackUrl = this.callbackUrl;
@@ -149,7 +153,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
     // Store pending auth keyed by upstream state
     this.pendingAuths.set(upstreamState, {
       upstreamState,
-      upstreamPkce: upstreamPkce ?? { codeVerifier: '', codeChallenge: '', codeChallengeMethod: 'S256' },
+      upstreamPkce,
       clientRedirectUri: params.redirectUri,
       clientState: params.state,
       clientCodeChallenge: params.codeChallenge,
@@ -192,7 +196,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
       oidcConfig,
       code,
       callbackUrl,
-      pending.upstreamPkce.codeVerifier ? pending.upstreamPkce : undefined
+      pending.upstreamPkce
     );
 
     // Generate our own auth code for the MCP client
