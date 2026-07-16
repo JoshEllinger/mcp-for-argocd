@@ -46,7 +46,12 @@ interface CompletedAuth {
 }
 
 interface StoredToken {
-  argocdAccessToken: string;
+  // ArgoCD validates the bearer credential as an OIDC RP: it checks the JWT's
+  // `aud` claim against its own client ID, which the spec only guarantees
+  // for the ID token (an access token's audience is provider-defined -- for
+  // Okta it's the authorization server itself, which ArgoCD rejects with
+  // "invalid session: failed to verify the token").
+  argocdIdToken: string;
   argocdRefreshToken?: string;
   oidcConfig: OIDCConfig;
   providerMetadata: OIDCProviderMetadata;
@@ -245,12 +250,16 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
     }
     this.completedAuths.delete(authorizationCode);
 
+    if (!completed.argocdToken.idToken) {
+      throw new Error('ArgoCD OIDC exchange returned no ID token');
+    }
+
     // Generate opaque tokens that map to the real ArgoCD tokens
     const opaqueAccessToken = generateOpaqueToken();
     const opaqueRefreshToken = completed.argocdToken.refreshToken ? generateOpaqueToken() : undefined;
 
     this.accessTokens.set(opaqueAccessToken, {
-      argocdAccessToken: completed.argocdToken.accessToken,
+      argocdIdToken: completed.argocdToken.idToken,
       argocdRefreshToken: completed.argocdToken.refreshToken,
       oidcConfig: completed.oidcConfig,
       providerMetadata: completed.providerMetadata,
@@ -297,12 +306,16 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
       stored.upstreamRefreshToken,
     );
 
+    if (!newArgocdToken.idToken) {
+      throw new Error('ArgoCD OIDC refresh returned no ID token');
+    }
+
     // Generate new opaque tokens
     const newAccessToken = generateOpaqueToken();
     const newRefreshToken = newArgocdToken.refreshToken ? generateOpaqueToken() : undefined;
 
     this.accessTokens.set(newAccessToken, {
-      argocdAccessToken: newArgocdToken.accessToken,
+      argocdIdToken: newArgocdToken.idToken,
       argocdRefreshToken: newArgocdToken.refreshToken,
       oidcConfig: stored.oidcConfig,
       providerMetadata: stored.providerMetadata,
@@ -350,7 +363,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
       scopes: [],
       expiresAt: stored.expiresAt ? Math.floor(stored.expiresAt / 1000) : undefined,
       extra: {
-        argocdToken: stored.argocdAccessToken,
+        argocdToken: stored.argocdIdToken,
         argocdBaseUrl: this.argocdServerUrl,
       },
     };
