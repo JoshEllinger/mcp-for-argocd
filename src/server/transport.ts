@@ -263,6 +263,10 @@ export const connectHttpTransport = (port: number, options?: {
   const app = express();
   app.use(express.json());
 
+  app.get('/healthz', (_, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
   const httpTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
   if (options?.serverUrl) {
