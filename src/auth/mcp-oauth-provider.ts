@@ -180,6 +180,16 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
   }
 
   /**
+   * Whether this provider owns the given pending upstream `state`. Lets a
+   * shared callback listener (see startCallbackServer's multi-provider mode)
+   * route an incoming callback to the right provider by ownership rather
+   * than by trying each one and catching "unknown state" errors.
+   */
+  hasPendingState(state: string): boolean {
+    return this.pendingAuths.has(state);
+  }
+
+  /**
    * Handle the callback from ArgoCD's OIDC provider.
    * Called from the /callback route.
    *

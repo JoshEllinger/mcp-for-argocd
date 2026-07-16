@@ -3,6 +3,7 @@ import { hideBin } from 'yargs/helpers';
 import {
   connectStdioTransport,
   connectHttpTransport,
+  connectMultiEnvHttpTransport,
   connectSSETransport
 } from '../server/transport.js';
 import { performSSOLogin } from '../auth/sso-login.js';
@@ -57,6 +58,48 @@ export const cmd = () => {
     },
     ({ port, serverUrl, insecure, callbackPort }) =>
       connectHttpTransport(port, { serverUrl, insecure, callbackPort })
+  );
+
+  exe.command(
+    'http-multi',
+    'Start OAuth 2.1-authenticated ArgoCD MCP servers for multiple environments at once, sharing one OAuth callback listener.',
+    (yargs) => {
+      return yargs
+        .option('server', {
+          type: 'string',
+          array: true,
+          demandOption: true,
+          describe:
+            'One environment as "name=port,serverUrl", e.g. "dev=3000,https://argocd.dev.example.com". Repeat for each environment.'
+        })
+        .option('callback-port', {
+          type: 'number',
+          default: 8085,
+          describe: 'Shared port for the OAuth callback listener (must match what every environment\'s OIDC app has registered as its redirect_uri)'
+        })
+        .option('insecure', {
+          type: 'boolean',
+          default: false,
+          describe: 'Skip TLS certificate verification for all environments'
+        });
+    },
+    ({ server, callbackPort, insecure }) => {
+      const environments = server.map((spec) => {
+        const eqIndex = spec.indexOf('=');
+        const commaIndex = spec.indexOf(',', eqIndex);
+        if (eqIndex === -1 || commaIndex === -1) {
+          throw new Error(`Invalid --server value "${spec}" -- expected "name=port,serverUrl"`);
+        }
+        const name = spec.slice(0, eqIndex);
+        const port = Number(spec.slice(eqIndex + 1, commaIndex));
+        const serverUrl = spec.slice(commaIndex + 1);
+        if (!name || !Number.isInteger(port) || !serverUrl) {
+          throw new Error(`Invalid --server value "${spec}" -- expected "name=port,serverUrl"`);
+        }
+        return { name, port, serverUrl, insecure };
+      });
+      connectMultiEnvHttpTransport(callbackPort, environments);
+    }
   );
 
   exe.command(

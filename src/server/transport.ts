@@ -255,6 +255,140 @@ export const connectSSETransport = (port: number) => {
   app.listen(port);
 };
 
+/**
+ * Wire OAuth 2.1 routes (/.well-known/oauth-authorization-server, /authorize,
+ * /token, /register) and a bearer-authed /mcp POST handler onto `app` for one
+ * ArgoCD environment's provider. Shared between the single-environment
+ * connectHttpTransport and connectMultiEnvHttpTransport so N environments
+ * (each its own port, its own provider, its own set of these routes) don't
+ * duplicate this wiring -- only the callback listener (see
+ * connectMultiEnvHttpTransport) is actually shared across them.
+ */
+function installOAuthMcpRoutes(
+  app: express.Express,
+  provider: ArgocdOAuthProvider,
+  mcpBaseUrl: string,
+  httpTransports: { [sessionId: string]: StreamableHTTPServerTransport }
+): void {
+  app.use(mcpAuthRouter({
+    provider,
+    issuerUrl: new URL(mcpBaseUrl),
+    baseUrl: new URL(mcpBaseUrl),
+  }));
+
+  const bearerAuth = requireBearerAuth({ verifier: provider });
+
+  app.post('/mcp', bearerAuth, async (req, res) => {
+    const sessionIdFromHeader = req.headers['mcp-session-id'] as string | undefined;
+    let transport: StreamableHTTPServerTransport;
+
+    if (sessionIdFromHeader && httpTransports[sessionIdFromHeader]) {
+      transport = httpTransports[sessionIdFromHeader];
+    } else if (!sessionIdFromHeader && isInitializeRequest(req.body)) {
+      // Extract ArgoCD credentials from the verified OAuth token
+      const argocdToken = req.auth?.extra?.argocdToken as string;
+      const argocdBaseUrl = req.auth?.extra?.argocdBaseUrl as string;
+
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          httpTransports[newSessionId] = transport;
+        }
+      });
+
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          delete httpTransports[transport.sessionId];
+        }
+      };
+
+      const server = createServer({
+        argocdBaseUrl,
+        argocdApiToken: argocdToken,
+      });
+
+      await server.connect(transport);
+    } else {
+      const errorMsg = sessionIdFromHeader
+        ? `Invalid or expired session ID: ${sessionIdFromHeader}`
+        : 'Bad Request: Not an initialization request and no valid session ID provided.';
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: errorMsg
+        },
+        id: req.body?.id !== undefined ? req.body.id : null
+      });
+      return;
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !httpTransports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    await httpTransports[sessionId].handleRequest(req, res);
+  };
+
+  app.get('/mcp', handleSessionRequest);
+  app.delete('/mcp', handleSessionRequest);
+}
+
+/**
+ * Start OAuth 2.1-authenticated ArgoCD MCP servers for multiple environments
+ * side by side in one process, sharing a single callback listener.
+ *
+ * Each environment's Okta app in this fork's target org has its OAuth
+ * redirect_uri hardcoded to the same local port -- confirmed by testing (a
+ * different port gets rejected by Okta with invalid_request). That means
+ * only one process can ever bind that port as a dedicated listener, which is
+ * why running two separate `argocd-mcp http --server-url ...` processes (one
+ * per environment) can't work simultaneously. The fix isn't to avoid sharing
+ * the port -- it's to share it deliberately: one callback listener, handed a
+ * provider per environment, dispatching each incoming callback to whichever
+ * provider's `state` it recognizes (see startCallbackServer). Each
+ * environment still gets its own MCP server port, its own OAuth
+ * authorize/token/register routes, and its own independent OAuth session --
+ * only the physical callback listener is shared.
+ */
+export const connectMultiEnvHttpTransport = (
+  callbackPort: number,
+  environments: { name: string; port: number; serverUrl: string; insecure?: boolean }[]
+) => {
+  const providers = environments.map(
+    (env) => new ArgocdOAuthProvider(env.serverUrl, callbackPort, env.insecure)
+  );
+
+  startCallbackServer(providers, callbackPort).catch((err) => {
+    logger.error({ error: err instanceof Error ? err.message : String(err) }, 'Failed to start shared OAuth callback server');
+    process.exit(1);
+  });
+
+  environments.forEach((env, i) => {
+    const provider = providers[i];
+    const app = express();
+    app.use(express.json());
+
+    app.get('/healthz', (_, res) => {
+      res.status(200).json({ status: 'ok' });
+    });
+
+    const httpTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+    installOAuthMcpRoutes(app, provider, `http://localhost:${env.port}`, httpTransports);
+
+    logger.info(
+      { name: env.name, serverUrl: env.serverUrl, port: env.port, callbackPort },
+      'OAuth 2.1 authentication enabled for HTTP transport (multi-environment)'
+    );
+    app.listen(env.port);
+  });
+};
+
 export const connectHttpTransport = (port: number, options?: {
   serverUrl?: string;
   insecure?: boolean;
@@ -275,68 +409,12 @@ export const connectHttpTransport = (port: number, options?: {
     const mcpBaseUrl = `http://localhost:${port}`;
     const provider = new ArgocdOAuthProvider(options.serverUrl, callbackPort, options.insecure);
 
-    // Install OAuth routes (/.well-known/oauth-authorization-server, /authorize, /token, /register)
-    app.use(mcpAuthRouter({
-      provider,
-      issuerUrl: new URL(mcpBaseUrl),
-      baseUrl: new URL(mcpBaseUrl),
-    }));
+    installOAuthMcpRoutes(app, provider, mcpBaseUrl, httpTransports);
 
     // Start standalone callback server on the Dex-registered port
     startCallbackServer(provider, callbackPort).catch((err) => {
       logger.error({ error: err instanceof Error ? err.message : String(err) }, 'Failed to start OAuth callback server');
       process.exit(1);
-    });
-
-    // Protect /mcp with bearer auth
-    const bearerAuth = requireBearerAuth({ verifier: provider });
-
-    app.post('/mcp', bearerAuth, async (req, res) => {
-      const sessionIdFromHeader = req.headers['mcp-session-id'] as string | undefined;
-      let transport: StreamableHTTPServerTransport;
-
-      if (sessionIdFromHeader && httpTransports[sessionIdFromHeader]) {
-        transport = httpTransports[sessionIdFromHeader];
-      } else if (!sessionIdFromHeader && isInitializeRequest(req.body)) {
-        // Extract ArgoCD credentials from the verified OAuth token
-        const argocdToken = req.auth?.extra?.argocdToken as string;
-        const argocdBaseUrl = req.auth?.extra?.argocdBaseUrl as string;
-
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            httpTransports[newSessionId] = transport;
-          }
-        });
-
-        transport.onclose = () => {
-          if (transport.sessionId) {
-            delete httpTransports[transport.sessionId];
-          }
-        };
-
-        const server = createServer({
-          argocdBaseUrl,
-          argocdApiToken: argocdToken,
-        });
-
-        await server.connect(transport);
-      } else {
-        const errorMsg = sessionIdFromHeader
-          ? `Invalid or expired session ID: ${sessionIdFromHeader}`
-          : 'Bad Request: Not an initialization request and no valid session ID provided.';
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: errorMsg
-          },
-          id: req.body?.id !== undefined ? req.body.id : null
-        });
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
     });
 
     logger.info(
@@ -407,20 +485,20 @@ export const connectHttpTransport = (port: number, options?: {
 
       await transport.handleRequest(req, res, req.body);
     });
+
+    const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !httpTransports[sessionId]) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      const transport = httpTransports[sessionId];
+      await transport.handleRequest(req, res);
+    };
+
+    app.get('/mcp', handleSessionRequest);
+    app.delete('/mcp', handleSessionRequest);
   }
-
-  const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !httpTransports[sessionId]) {
-      res.status(400).send('Invalid or missing session ID');
-      return;
-    }
-    const transport = httpTransports[sessionId];
-    await transport.handleRequest(req, res);
-  };
-
-  app.get('/mcp', handleSessionRequest);
-  app.delete('/mcp', handleSessionRequest);
 
   logger.info(`Connecting to Http Stream transport on port: ${port}`);
   app.listen(port);

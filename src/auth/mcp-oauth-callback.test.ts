@@ -14,6 +14,7 @@ vi.mock('../logging/logging.js', () => ({
 function makeProvider(overrides: Partial<ArgocdOAuthProvider> = {}) {
   return {
     handleUpstreamCallback: vi.fn(),
+    hasPendingState: vi.fn().mockReturnValue(true),
     ...overrides
   } as unknown as ArgocdOAuthProvider;
 }
@@ -118,5 +119,42 @@ describe('startCallbackServer', () => {
     const res = await fetch(`http://127.0.0.1:${port}/other`);
 
     expect(res.status).toBe(404);
+  });
+
+  it('should dispatch to whichever provider owns the callback state, when given multiple', async () => {
+    const devRedirect = 'http://client.example.com/callback?code=dev-code&state=client-state';
+    const devProvider = makeProvider({
+      hasPendingState: vi.fn().mockReturnValue(false),
+      handleUpstreamCallback: vi.fn().mockResolvedValue(devRedirect)
+    });
+    const prodProvider = makeProvider({
+      hasPendingState: vi.fn().mockReturnValue(true),
+      handleUpstreamCallback: vi.fn().mockResolvedValue(devRedirect)
+    });
+
+    const port = 18907;
+    shutdownFn = await startCallbackServer([devProvider, prodProvider], port);
+
+    const res = await fetch(`http://127.0.0.1:${port}/auth/callback?code=upstream-code&state=prod-state`, {
+      redirect: 'manual'
+    });
+
+    expect(res.status).toBe(302);
+    expect(devProvider.handleUpstreamCallback).not.toHaveBeenCalled();
+    expect(prodProvider.handleUpstreamCallback).toHaveBeenCalledWith('upstream-code', 'prod-state');
+  });
+
+  it('should return 400 when no provider recognizes the callback state', async () => {
+    const devProvider = makeProvider({ hasPendingState: vi.fn().mockReturnValue(false) });
+    const prodProvider = makeProvider({ hasPendingState: vi.fn().mockReturnValue(false) });
+
+    const port = 18908;
+    shutdownFn = await startCallbackServer([devProvider, prodProvider], port);
+
+    const res = await fetch(`http://127.0.0.1:${port}/auth/callback?code=upstream-code&state=nobody-state`);
+
+    expect(res.status).toBe(400);
+    expect(devProvider.handleUpstreamCallback).not.toHaveBeenCalled();
+    expect(prodProvider.handleUpstreamCallback).not.toHaveBeenCalled();
   });
 });
