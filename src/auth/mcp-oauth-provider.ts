@@ -64,6 +64,16 @@ function generateOpaqueToken(): string {
   return randomBytes(32).toString('base64url');
 }
 
+// How long the *opaque* MCP session token is reported as valid for, decoupled
+// from the *upstream* ArgoCD/Okta token's real (short, ~1hr) lifetime -- see
+// the comment on verifyAccessToken for why these must not be the same value.
+const OPAQUE_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// Refresh the upstream token this many ms before its real expiry, so a
+// request that lands right at the boundary doesn't race a still-valid-but-
+// about-to-expire token.
+const UPSTREAM_REFRESH_SKEW_MS = 60 * 1000;
+
 /**
  * Custom OAuthServerProvider that proxies MCP OAuth 2.1 to ArgoCD's OIDC/Dex.
  *
@@ -280,9 +290,9 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
     const tokens: OAuthTokens = {
       access_token: opaqueAccessToken,
       token_type: 'Bearer',
-      expires_in: completed.argocdToken.expiresAt
-        ? Math.floor((completed.argocdToken.expiresAt - Date.now()) / 1000)
-        : undefined,
+      // Deliberately NOT tied to the upstream ArgoCD/Okta token's short
+      // (~1hr) expiry -- see the comment on verifyAccessToken.
+      expires_in: Math.floor(OPAQUE_TOKEN_TTL_MS / 1000),
       refresh_token: opaqueRefreshToken,
     };
 
@@ -338,9 +348,9 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
     const tokens: OAuthTokens = {
       access_token: newAccessToken,
       token_type: 'Bearer',
-      expires_in: newArgocdToken.expiresAt
-        ? Math.floor((newArgocdToken.expiresAt - Date.now()) / 1000)
-        : undefined,
+      // Deliberately NOT tied to the upstream ArgoCD/Okta token's short
+      // (~1hr) expiry -- see the comment on verifyAccessToken.
+      expires_in: Math.floor(OPAQUE_TOKEN_TTL_MS / 1000),
       refresh_token: newRefreshToken,
     };
 
@@ -349,19 +359,66 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
   }
 
   /**
-   * Verify an opaque access token and return AuthInfo with the real ArgoCD credentials
+   * Verify an opaque access token and return AuthInfo with the real ArgoCD credentials.
+   *
+   * The MCP SDK's requireBearerAuth middleware rejects the request outright
+   * with a 401 the moment `AuthInfo.expiresAt` is in the past -- it does not
+   * know or care that a refresh_token grant exists. Observed in practice:
+   * once that happened here (because expiresAt mirrored the upstream ArgoCD/
+   * Okta token's real ~1hr lifetime), the MCP client did not fall back to
+   * calling exchangeRefreshToken -- it just registered a brand-new OAuth
+   * client and redid the full interactive login, which is what "logs out
+   * every hour" actually was.
+   *
+   * The fix: never let the client-visible expiry track the upstream token's
+   * real (short) lifetime. Report a long-lived session (OPAQUE_TOKEN_TTL_MS)
+   * unconditionally, and instead silently refresh the *upstream* credential
+   * right here, on the request path, whenever it's stale or about to be --
+   * invisible to the MCP client, which only ever sees a token that "hasn't
+   * expired yet". The upstream refresh token is the real, final ceiling on
+   * session length (however long ArgoCD/Okta issues those for); once that
+   * itself is rejected, this throws and the client is forced into a real
+   * re-login, same as before.
    */
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const stored = this.accessTokens.get(token);
+    let stored = this.accessTokens.get(token);
     if (!stored) {
       throw new Error('Invalid or expired access token');
+    }
+
+    const upstreamStale = stored.expiresAt !== undefined
+      && stored.expiresAt - UPSTREAM_REFRESH_SKEW_MS <= Date.now();
+
+    if (upstreamStale) {
+      if (!stored.argocdRefreshToken) {
+        throw new Error('Upstream ArgoCD token expired and no refresh token is available -- please log in again');
+      }
+
+      const refreshed = await refreshAccessToken(
+        stored.providerMetadata,
+        stored.oidcConfig,
+        stored.argocdRefreshToken
+      );
+
+      if (!refreshed.idToken) {
+        throw new Error('ArgoCD OIDC refresh returned no ID token -- please log in again');
+      }
+
+      stored = {
+        ...stored,
+        argocdIdToken: refreshed.idToken,
+        argocdRefreshToken: refreshed.refreshToken ?? stored.argocdRefreshToken,
+        expiresAt: refreshed.expiresAt,
+      };
+      this.accessTokens.set(token, stored);
+      logger.info({ clientId: stored.clientId }, 'Silently refreshed upstream ArgoCD token during request verification');
     }
 
     return {
       token,
       clientId: stored.clientId,
       scopes: [],
-      expiresAt: stored.expiresAt ? Math.floor(stored.expiresAt / 1000) : undefined,
+      expiresAt: Math.floor((Date.now() + OPAQUE_TOKEN_TTL_MS) / 1000),
       extra: {
         argocdToken: stored.argocdIdToken,
         argocdBaseUrl: this.argocdServerUrl,
@@ -389,9 +446,13 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
       }
     }
 
-    // Clean up expired access tokens
+    // Clean up access tokens past the *opaque* session TTL -- not the
+    // upstream ArgoCD/Okta token's short expiresAt, which verifyAccessToken
+    // silently refreshes past on every request. Evicting on that shorter
+    // window would delete the entry verifyAccessToken needs in order to
+    // refresh it, undoing the whole point of decoupling the two.
     for (const [key, stored] of this.accessTokens) {
-      if (stored.expiresAt && now > stored.expiresAt) {
+      if (now - stored.createdAt > OPAQUE_TOKEN_TTL_MS) {
         this.accessTokens.delete(key);
       }
     }
