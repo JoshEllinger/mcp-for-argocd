@@ -38,7 +38,7 @@ const dynamicServerArgsSchema = {
     .string()
     .optional()
     .describe(
-      'ArgoCD base URL to target for this call instead of the server default -- e.g. a Managed Fusion customer ArgoCD you have already logged into via `argocd-mcp login <url>`. Omit to use this server\'s configured default.'
+      "ArgoCD base URL to target for this call instead of the server default -- e.g. a Managed Fusion customer ArgoCD you have already logged into via `argocd-mcp login <url>`. Omit to use this server's configured default."
     )
 } satisfies ZodRawShape;
 
@@ -112,14 +112,8 @@ export class Server extends McpServer {
       'list_clusters',
       'list_clusters returns list of clusters registered with ArgoCD',
       {
-        server: z
-          .string()
-          .optional()
-          .describe('Filter clusters by server URL. Optional.'),
-        name: z
-          .string()
-          .optional()
-          .describe('Filter clusters by name. Optional.')
+        server: z.string().optional().describe('Filter clusters by server URL. Optional.'),
+        name: z.string().optional().describe('Filter clusters by name. Optional.')
       },
       async ({ server, name }, client) =>
         await client.listClusters({

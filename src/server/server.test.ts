@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createServer } from './server.js';
 
 vi.mock('../argocd/client.js', () => {
-  const instances: any[] = [];
+  const instances: unknown[] = [];
   class ArgoCDClient {
     baseUrl: string;
     apiToken: string;
@@ -14,7 +14,9 @@ vi.mock('../argocd/client.js', () => {
     constructor(opts: { baseUrl: string; apiToken: string; tokenRefreshProvider?: unknown }) {
       this.baseUrl = opts.baseUrl;
       this.apiToken = opts.apiToken;
-      this.listApplications = vi.fn().mockResolvedValue([{ metadata: { name: 'from-' + this.baseUrl } }]);
+      this.listApplications = vi
+        .fn()
+        .mockResolvedValue([{ metadata: { name: 'from-' + this.baseUrl } }]);
       instances.push(this);
     }
   }
@@ -25,8 +27,17 @@ vi.mock('../auth/token-refresh.js', () => ({
   createTokenRefreshProvider: vi.fn().mockReturnValue({ refreshToken: vi.fn() })
 }));
 
+type ToolCallResult = {
+  isError: boolean;
+  content: Array<{ type: string; text: string }>;
+};
+
+type ServerWithRegisteredTools = {
+  _registeredTools: Record<string, { handler: (...args: unknown[]) => Promise<ToolCallResult> }>;
+};
+
 function getTool(server: ReturnType<typeof createServer>, name: string) {
-  return (server as any)._registeredTools[name];
+  return (server as unknown as ServerWithRegisteredTools)._registeredTools[name];
 }
 
 describe('Server dynamic argocdBaseUrl targeting', () => {
@@ -116,7 +127,9 @@ describe('Server dynamic argocdBaseUrl targeting', () => {
     const result = await tool.handler({ argocdBaseUrl: 'https://costco.example.com' }, {});
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('does not support targeting a different ArgoCD base URL');
+    expect(result.content[0].text).toContain(
+      'does not support targeting a different ArgoCD base URL'
+    );
   });
 
   it('does not require default authentication when argocdBaseUrl is provided', async () => {
