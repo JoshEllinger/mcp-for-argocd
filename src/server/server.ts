@@ -34,7 +34,7 @@ const dynamicServerArgsSchema = {
     .string()
     .optional()
     .describe(
-      'ArgoCD base URL to target for this call instead of the server default -- e.g. another ArgoCD instance you have already logged into via `argocd-mcp login <url>`. Omit to use this server\'s configured default.'
+      "ArgoCD base URL to target for this call instead of the server default -- e.g. another ArgoCD instance you have already logged into via `argocd-mcp login <url>`. Omit to use this server's configured default."
     )
 } satisfies ZodRawShape;
 
