@@ -216,7 +216,15 @@ export const connectStdioTransport = async () => {
     argocdBaseUrl: auth?.baseUrl ?? '',
     argocdApiToken: auth?.apiToken ?? '',
     tokenRefreshProvider,
-    isAuthenticated: auth !== null
+    isAuthenticated: auth !== null,
+    // Lets any tool call target a different ArgoCD base URL than this
+    // process's default via the argocdBaseUrl argument (see server.ts),
+    // reusing the same SSO token store `argocd-mcp login <url>` already
+    // writes to.
+    resolveServerAuth: async (serverUrl: string) => {
+      const resolved = await resolveAuth({ serverUrl });
+      return resolved ? { baseUrl: resolved.baseUrl, apiToken: resolved.apiToken } : null;
+    }
   });
 
   logger.info('Connecting to stdio transport');
