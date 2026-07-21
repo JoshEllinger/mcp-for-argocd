@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { OIDCConfig } from '../auth/types.js';
 
 const mockCreateServer = vi.fn().mockReturnValue({ connect: vi.fn().mockResolvedValue(undefined) });
 
@@ -52,10 +53,17 @@ describe('connectStdioTransport resolveServerAuth wiring', () => {
 
   it('resolveServerAuth returns baseUrl/apiToken for a server with a valid stored token', async () => {
     const { loadToken, isTokenExpired } = await import('../auth/token-store.js');
+    const oidcConfig: OIDCConfig = {
+      issuer: 'https://dex.example.com',
+      clientID: 'argo-cd-cli',
+      scopes: ['openid', 'profile', 'email'],
+      enablePKCEAuthentication: true,
+      useDex: true
+    };
     vi.mocked(loadToken).mockResolvedValue({
       serverUrl: 'https://mouser.example.com',
       token: { accessToken: 'access', idToken: 'id-token' },
-      oidcConfig: {} as any,
+      oidcConfig,
       storedAt: Date.now()
     });
     vi.mocked(isTokenExpired).mockReturnValue(false);
