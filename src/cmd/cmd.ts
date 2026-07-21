@@ -10,6 +10,27 @@ import { performSSOLogin } from '../auth/sso-login.js';
 import { deleteToken, listServers, loadToken } from '../auth/token-store.js';
 import { SSONotConfiguredError } from '../auth/settings.js';
 
+// Node's fetch() throws a bare `TypeError: fetch failed` with the actually
+// useful detail (ECONNREFUSED, ENOTFOUND, ETIMEDOUT, etc.) nested in `cause`
+// -- printing err.message alone silently discards it. Walks the full cause
+// chain since undici's own connect errors can themselves have a cause.
+export function formatErrorWithCause(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return String(err);
+  }
+  let message = err.message;
+  // `Error.cause` is an ES2022 addition; this project's tsconfig targets
+  // ES2016, so the property isn't in the type lib even though every
+  // supported Node runtime has it. Read it via an unknown cast rather than
+  // widen the project's global lib target for one property.
+  let cause = (err as { cause?: unknown }).cause;
+  while (cause instanceof Error) {
+    message += `\n  Caused by: ${cause.message}`;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return message;
+}
+
 export const cmd = () => {
   const exe = yargs(hideBin(process.argv));
 
@@ -145,7 +166,7 @@ export const cmd = () => {
           );
           process.exit(1);
         }
-        console.error(`Login failed: ${err instanceof Error ? err.message : err}`);
+        console.error(`Login failed: ${formatErrorWithCause(err)}`);
         process.exit(1);
       }
     }
