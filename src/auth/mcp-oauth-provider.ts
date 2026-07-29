@@ -8,6 +8,7 @@ import { fetchOIDCSettings, fetchOIDCProviderMetadata } from './settings.js';
 import { generateState, generatePKCEChallenge, buildAuthorizationUrl, exchangeCodeForToken, refreshAccessToken } from './oauth.js';
 import type { OIDCConfig, OIDCProviderMetadata, PKCEChallenge, TokenInfo } from './types.js';
 import { logger } from '../logging/logging.js';
+import { loadOAuthProviderState, saveOAuthProviderState } from './oauth-provider-store.js';
 
 interface PendingAuth {
   /** Our generated state for the upstream OIDC flow */
@@ -107,12 +108,20 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
 
   private callbackUrl: string;
 
+  // Resolves once any persisted clients/accessTokens/refreshTokens for this
+  // argocdServerUrl have been loaded from disk -- awaited by every method
+  // that reads or writes those three maps, so a freshly-constructed instance
+  // (e.g. after the local server process restarted) sees what an earlier
+  // instance persisted, instead of starting empty.
+  private ready: Promise<void>;
+
   constructor(
     private argocdServerUrl: string,
     callbackPort: number = 8085,
     private insecure: boolean = false
   ) {
     this.callbackUrl = `http://localhost:${callbackPort}/auth/callback`;
+    this.ready = this.loadPersisted();
     // Periodic cleanup of stale state (every 5 minutes)
     this.cleanupInterval = setInterval(() => this.cleanup(), 5 * 60 * 1000);
     // Don't keep process alive just for cleanup
@@ -121,10 +130,35 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
     }
   }
 
+  private async loadPersisted(): Promise<void> {
+    const state = await loadOAuthProviderState(this.argocdServerUrl);
+    for (const [clientId, client] of Object.entries(state.clients)) {
+      this.clients.set(clientId, client);
+    }
+    for (const [token, stored] of Object.entries(state.accessTokens)) {
+      this.accessTokens.set(token, stored);
+    }
+    for (const [token, stored] of Object.entries(state.refreshTokens)) {
+      this.refreshTokens.set(token, stored);
+    }
+  }
+
+  private async persist(): Promise<void> {
+    await saveOAuthProviderState(this.argocdServerUrl, {
+      clients: Object.fromEntries(this.clients),
+      accessTokens: Object.fromEntries(this.accessTokens),
+      refreshTokens: Object.fromEntries(this.refreshTokens)
+    });
+  }
+
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
-      getClient: (clientId: string) => this.clients.get(clientId),
-      registerClient: (clientMetadata) => {
+      getClient: async (clientId: string) => {
+        await this.ready;
+        return this.clients.get(clientId);
+      },
+      registerClient: async (clientMetadata) => {
+        await this.ready;
         const clientId = randomBytes(16).toString('hex');
         const client: OAuthClientInformationFull = {
           ...clientMetadata,
@@ -132,6 +166,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
           client_id_issued_at: Math.floor(Date.now() / 1000),
         };
         this.clients.set(clientId, client);
+        await this.persist();
         logger.info({ clientId, clientName: client.client_name }, 'Registered new MCP OAuth client');
         return client;
       },
@@ -271,6 +306,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
    * Exchange our auth code for an opaque access token
    */
   async exchangeAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<OAuthTokens> {
+    await this.ready;
     const completed = this.completedAuths.get(authorizationCode);
     if (!completed) {
       throw new Error('Unknown or expired authorization code');
@@ -313,6 +349,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
       refresh_token: opaqueRefreshToken,
     };
 
+    await this.persist();
     logger.info({ clientId: client.client_id }, 'Issued MCP access token');
     return tokens;
   }
@@ -321,6 +358,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
    * Refresh: exchange our opaque refresh token for a new opaque access token
    */
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string): Promise<OAuthTokens> {
+    await this.ready;
     const stored = this.refreshTokens.get(refreshToken);
     if (!stored) {
       throw new Error('Unknown or expired refresh token');
@@ -371,6 +409,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
       refresh_token: newRefreshToken,
     };
 
+    await this.persist();
     logger.info({ clientId: client.client_id }, 'Refreshed MCP access token');
     return tokens;
   }
@@ -398,6 +437,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
    * re-login, same as before.
    */
   async verifyAccessToken(token: string): Promise<AuthInfo> {
+    await this.ready;
     let stored = this.accessTokens.get(token);
     if (!stored) {
       throw new Error('Invalid or expired access token');
@@ -428,6 +468,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
         expiresAt: refreshed.expiresAt,
       };
       this.accessTokens.set(token, stored);
+      await this.persist();
       logger.info({ clientId: stored.clientId }, 'Silently refreshed upstream ArgoCD token during request verification');
     }
 
@@ -468,10 +509,18 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
     // silently refreshes past on every request. Evicting on that shorter
     // window would delete the entry verifyAccessToken needs in order to
     // refresh it, undoing the whole point of decoupling the two.
+    let removedAccessToken = false;
     for (const [key, stored] of this.accessTokens) {
       if (now - stored.createdAt > OPAQUE_TOKEN_TTL_MS) {
         this.accessTokens.delete(key);
+        removedAccessToken = true;
       }
+    }
+
+    if (removedAccessToken) {
+      this.persist().catch((err) => {
+        logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'Failed to persist OAuth state after cleanup');
+      });
     }
   }
 

@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ArgocdOAuthProvider } from './mcp-oauth-provider.js';
 
 vi.mock('./settings.js', () => ({
@@ -45,6 +48,24 @@ const mockProviderMetadata = {
 };
 
 describe('ArgocdOAuthProvider', () => {
+  let tempDir: string;
+  let originalXdgConfigHome: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'argocd-mcp-oauth-provider-test-'));
+    originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = tempDir;
+  });
+
+  afterEach(async () => {
+    if (originalXdgConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(fetchOIDCSettings).mockResolvedValue(mockOidcConfig);
@@ -267,6 +288,53 @@ describe('ArgocdOAuthProvider', () => {
     it('throws for an unknown token', async () => {
       const provider = new ArgocdOAuthProvider('https://argocd.example.com');
       await expect(provider.verifyAccessToken('nonexistent-token')).rejects.toThrow(/Invalid or expired/);
+    });
+  });
+
+  describe('persistence across restarts', () => {
+    it('a second provider instance for the same server can use a client registered by the first', async () => {
+      const first = new ArgocdOAuthProvider('https://argocd.example.com');
+      const registered = await first.clientsStore.registerClient!({
+        redirect_uris: ['http://localhost/callback'],
+        client_name: 'Test Client'
+      } as any);
+
+      // Simulate a restart: a brand-new instance, same server URL, no
+      // in-memory state carried over -- only what's on disk.
+      const second = new ArgocdOAuthProvider('https://argocd.example.com');
+      const retrieved = await second.clientsStore.getClient(registered.client_id);
+
+      expect(retrieved).toEqual(registered);
+    });
+
+    it('a second provider instance can verify an access token issued by the first', async () => {
+      const first = new ArgocdOAuthProvider('https://argocd.example.com');
+
+      vi.mocked(exchangeCodeForToken).mockResolvedValue({
+        accessToken: 'upstream-access-token',
+        idToken: 'id-token',
+        refreshToken: 'upstream-refresh-token',
+        expiresAt: Date.now() + 3600_000
+      });
+
+      const mockRes = { redirect: vi.fn() } as any;
+      await first.authorize(
+        { client_id: 'test-client', client_id_issued_at: 0, redirect_uris: ['http://localhost/callback'] } as any,
+        { redirectUri: 'http://localhost/callback', codeChallenge: 'challenge', state: 'client-state' } as any,
+        mockRes
+      );
+      const redirectUrl = await first.handleUpstreamCallback('upstream-code', 'mock-upstream-state');
+      const ourAuthCode = new URL(redirectUrl).searchParams.get('code')!;
+      const tokens = await first.exchangeAuthorizationCode(
+        { client_id: 'test-client', client_id_issued_at: 0, redirect_uris: ['http://localhost/callback'] } as any,
+        ourAuthCode
+      );
+
+      // Simulate a restart.
+      const second = new ArgocdOAuthProvider('https://argocd.example.com');
+      const authInfo = await second.verifyAccessToken(tokens.access_token);
+
+      expect(authInfo.extra?.argocdToken).toBe('id-token');
     });
   });
 });
