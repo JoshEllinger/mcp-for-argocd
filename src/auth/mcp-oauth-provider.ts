@@ -45,7 +45,7 @@ interface CompletedAuth {
   createdAt: number;
 }
 
-interface StoredToken {
+export interface StoredToken {
   // ArgoCD validates the bearer credential as an OIDC RP: it checks the JWT's
   // `aud` claim against its own client ID, which the spec only guarantees
   // for the ID token (an access token's audience is provider-defined -- for
@@ -58,6 +58,13 @@ interface StoredToken {
   clientId: string;
   expiresAt?: number;
   createdAt: number;
+}
+
+export interface StoredRefreshToken {
+  upstreamRefreshToken: string;
+  oidcConfig: OIDCConfig;
+  providerMetadata: OIDCProviderMetadata;
+  clientId: string;
 }
 
 function generateOpaqueToken(): string {
@@ -90,7 +97,7 @@ export class ArgocdOAuthProvider implements OAuthServerProvider {
   private pendingAuths = new Map<string, PendingAuth>();
   private completedAuths = new Map<string, CompletedAuth>();
   private accessTokens = new Map<string, StoredToken>();
-  private refreshTokens = new Map<string, { upstreamRefreshToken: string; oidcConfig: OIDCConfig; providerMetadata: OIDCProviderMetadata; clientId: string }>();
+  private refreshTokens = new Map<string, StoredRefreshToken>();
 
   private cachedOidcConfig?: OIDCConfig;
   private cachedProviderMetadata?: OIDCProviderMetadata;
